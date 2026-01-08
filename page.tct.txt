@@ -1,0 +1,319 @@
+"use client";
+
+import React, { useState, useEffect, useRef } from "react";
+import { 
+  Send, Paperclip, PlusCircle, Bot, User, FileText, Loader2, AlertCircle, MessageSquare, Trash2
+} from "lucide-react";
+import ReactMarkdown from "react-markdown";
+
+const API_URL = "http://localhost:8000"; 
+const MAX_FILE_SIZE = 10 * 1024 * 1024; 
+
+type Message = {
+  id: number;
+  role: "user" | "assistant" | "system";
+  content: string;
+  fileName?: string;
+};
+
+// New Type for tracking session history
+type StoredSession = {
+  id: string;
+  preview: string;
+  createdAt: number;
+};
+
+export default function ChatPage() {
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  
+  // --- NEW: State for Sidebar History ---
+  const [sessionList, setSessionList] = useState<StoredSession[]>([]);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // --- 1. Load Session List from LocalStorage on Mount ---
+  useEffect(() => {
+    const saved = localStorage.getItem("chat_sessions");
+    if (saved) {
+      setSessionList(JSON.parse(saved));
+    }
+  }, []);
+
+  // --- 2. Initialize First Session if none exists ---
+  useEffect(() => {
+    if (!sessionId && sessionList.length === 0) {
+      createNewSession();
+    } else if (!sessionId && sessionList.length > 0) {
+      // Optional: Load the most recent chat automatically
+      loadSession(sessionList[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-scroll
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // --- NEW: Function to Load an Old Session ---
+  const loadSession = async (id: string) => {
+    if (isStreaming) return;
+    setIsStreaming(true);
+    setError(null);
+    try {
+      // Fetch history from backend
+      const res = await fetch(`${API_URL}/session/${id}`);
+      if (!res.ok) throw new Error("Session not found");
+      
+      const data = await res.json(); // { history: [], file_context: "" }
+      
+      // Convert Backend History to Frontend Message Format
+      const restoredMessages: Message[] = data.history.map((item: any, index: number) => ({
+        id: index,
+        role: item.role,
+        content: item.content,
+        // We don't strictly know which message had the file attached in the backend history 
+        // without more backend changes, so we leave fileName undefined for old chats.
+      }));
+
+      setSessionId(id);
+      setMessages(restoredMessages);
+    } catch (err) {
+      setError("Failed to load old chat.");
+      // If failed, remove from list?
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const createNewSession = async () => {
+    try {
+      setIsStreaming(true);
+      const res = await fetch(`${API_URL}/new_session`);
+      if (!res.ok) throw new Error("Failed to create session");
+      
+      const data = await res.json();
+      const newId = data.session_id;
+
+      setSessionId(newId);
+      setMessages([]);
+      setSelectedFile(null);
+      setError(null);
+
+      // --- FIX: Add to History List ---
+      const newSessionItem: StoredSession = {
+        id: newId,
+        preview: "New Conversation",
+        createdAt: Date.now()
+      };
+      
+      const updatedList = [newSessionItem, ...sessionList];
+      setSessionList(updatedList);
+      localStorage.setItem("chat_sessions", JSON.stringify(updatedList));
+
+    } catch (err: any) {
+      setError("Could not connect to backend.");
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      if (file.size > MAX_FILE_SIZE) {
+        setError("File too large. Max 10MB.");
+        return;
+      }
+      setSelectedFile(file);
+      setError(null);
+    }
+  };
+
+  // --- Update Preview Title in Sidebar ---
+  const updateSessionPreview = (id: string, firstMessage: string) => {
+    const updatedList = sessionList.map(s => 
+      s.id === id ? { ...s, preview: firstMessage.substring(0, 30) + "..." } : s
+    );
+    setSessionList(updatedList);
+    localStorage.setItem("chat_sessions", JSON.stringify(updatedList));
+  };
+
+  const handleSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if ((!input.trim() && !selectedFile) || !sessionId || isStreaming) return;
+
+    const currentInput = input;
+    const currentFile = selectedFile;
+    const currentSessionId = sessionId; // capture for closure
+
+    // Update Sidebar Preview if it's the first message
+    if (messages.length === 0 && currentInput) {
+      updateSessionPreview(currentSessionId, currentInput);
+    }
+
+    const userMsgId = Date.now();
+    const userMsg: Message = { id: userMsgId, role: "user", content: currentInput, fileName: currentFile?.name };
+    const assistantMsgId = userMsgId + 1;
+    const assistantMsg: Message = { id: assistantMsgId, role: "assistant", content: "" };
+
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    setInput("");
+    setSelectedFile(null);
+    setIsStreaming(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("session_id", currentSessionId);
+      if (currentInput) formData.append("message", currentInput);
+      if (currentFile) formData.append("file", currentFile);
+
+      const response = await fetch(`${API_URL}/chat`, { method: "POST", body: formData });
+      if (!response.ok) throw new Error("Request failed");
+      if (!response.body) throw new Error("No response body");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let assistantContent = "";
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            if (data.trim() === "[DONE]") break;
+            assistantContent += data;
+            setMessages((prev) => prev.map((msg) => msg.id === assistantMsgId ? { ...msg, content: assistantContent } : msg));
+          }
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || "An error occurred.");
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-gray-950 text-gray-100 font-sans overflow-hidden">
+      
+      {/* --- SIDEBAR --- */}
+      <aside className="hidden md:flex flex-col w-64 bg-gray-900 border-r border-gray-800">
+        <div className="p-4 border-b border-gray-800">
+          <button
+            onClick={createNewSession}
+            disabled={isStreaming}
+            className="flex items-center gap-2 w-full p-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg text-white font-medium transition-colors"
+          >
+            <PlusCircle size={18} />
+            New Chat
+          </button>
+        </div>
+
+        {/* Session List */}
+        <div className="flex-1 overflow-y-auto p-2 scrollbar-thin">
+          <div className="text-xs font-semibold text-gray-500 mb-2 px-2 uppercase tracking-wider">History</div>
+          {sessionList.map((session) => (
+            <button
+              key={session.id}
+              onClick={() => loadSession(session.id)}
+              disabled={isStreaming}
+              className={`w-full text-left p-3 rounded-lg mb-1 text-sm transition-colors flex flex-col gap-1 
+                ${sessionId === session.id ? 'bg-gray-800 text-white border border-gray-700' : 'text-gray-400 hover:bg-gray-800/50 hover:text-gray-200'}
+              `}
+            >
+              <span className="font-medium truncate w-full">{session.preview}</span>
+              <span className="text-xs text-gray-600 font-mono">{session.id.slice(0, 8)}...</span>
+            </button>
+          ))}
+        </div>
+      </aside>
+
+      {/* --- MAIN CONTENT --- */}
+      <main className="flex-1 flex flex-col relative">
+        
+        {/* Mobile Header */}
+        <header className="md:hidden flex justify-between items-center p-4 bg-gray-900 border-b border-gray-800">
+          <div className="font-bold text-lg text-blue-400">LLM Chat</div>
+          <button onClick={createNewSession} disabled={isStreaming} className="text-gray-300">
+            <PlusCircle size={24} />
+          </button>
+        </header>
+
+        {/* Chat Area */}
+        <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scrollbar-thin">
+          {messages.length === 0 && !error && (
+            <div className="h-full flex flex-col items-center justify-center text-gray-500 opacity-60">
+              <MessageSquare size={48} className="mb-4 text-blue-500"/>
+              <p>Start a conversation or upload a file.</p>
+            </div>
+          )}
+
+          {messages.map((msg) => (
+            <div key={msg.id} className={`flex gap-4 ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+              {msg.role === "assistant" && (
+                <div className="w-8 h-8 rounded-full bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0 border border-blue-600/30">
+                  <Bot size={16} />
+                </div>
+              )}
+
+              <div className={`max-w-[85%] md:max-w-[75%] rounded-2xl p-4 shadow-sm ${msg.role === "user" ? "bg-gray-800 text-white border border-gray-700" : "bg-transparent text-gray-200"}`}>
+                {msg.fileName && (
+                  <div className="flex items-center gap-2 mb-3 p-2 bg-gray-900/50 rounded border border-gray-700 text-xs text-blue-300 w-fit">
+                    <FileText size={14} />
+                    <span>{msg.fileName}</span>
+                  </div>
+                )}
+                <div className="prose prose-invert prose-sm md:prose-base max-w-none">
+                  <ReactMarkdown>{msg.content}</ReactMarkdown>
+                </div>
+              </div>
+
+              {msg.role === "user" && (
+                <div className="w-8 h-8 rounded-full bg-gray-700 text-gray-300 flex items-center justify-center shrink-0">
+                  <User size={16} />
+                </div>
+              )}
+            </div>
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Input Area */}
+        <div className="p-4 bg-gray-900 border-t border-gray-800">
+          <form onSubmit={handleSubmit} className="max-w-4xl mx-auto flex items-end gap-2 bg-gray-950 p-2 rounded-xl border border-gray-700 focus-within:border-blue-500">
+            <label className={`p-3 text-gray-400 hover:text-blue-400 cursor-pointer ${isStreaming ? 'pointer-events-none opacity-50' : ''}`}>
+              <input type="file" className="hidden" onChange={handleFileChange} accept=".pdf,.txt,.jpg,.jpeg,.png" disabled={isStreaming} />
+              <Paperclip size={20} />
+            </label>
+            <div className="flex-1 flex flex-col">
+              {selectedFile && <div className="text-xs text-blue-300 mb-1">{selectedFile.name}</div>}
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
+                placeholder={isStreaming ? "AI is thinking..." : "Type your message..."}
+                disabled={isStreaming}
+                className="w-full bg-transparent text-gray-100 border-none focus:ring-0 resize-none max-h-32 py-3 px-2 scrollbar-hide"
+                rows={1}
+              />
+            </div>
+            <button type="submit" disabled={(!input.trim() && !selectedFile) || isStreaming} className={`p-3 rounded-lg ${!isStreaming ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-600'}`}>
+              {isStreaming ? <Loader2 size={20} className="animate-spin" /> : <Send size={20} />}
+            </button>
+          </form>
+        </div>
+      </main>
+    </div>
+  );
+}
