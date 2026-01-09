@@ -27,3 +27,5 @@ Cache embeddings & summary so subsequent requests are cheap.
 Bench: add a quick micro-benchmark that loads a 20k token context and measures latency/VRAM on your vLLM stack so you can set DOC_FULL_THRESHOLD empirically.
 
 If your system needs to scale horizontally, move embeddings to a vector DB (FAISS, Milvus, Pinecone, Qdrant).
+
+https://chatgpt.com/share/69606f55-d278-8003-a987-ebe18b6c4216
